@@ -1,0 +1,305 @@
+
+import google.generativeai as genai
+import pyttsx3
+import cv2
+from PIL import Image
+from datetime import datetime
+import io
+import speech_recognition as sr
+from ultralytics import YOLO
+import time
+import gpsd
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+from telethon import TelegramClient
+
+# ========== TEXT-TO-SPEECH ==========
+engine = pyttsx3.init()
+
+
+def speak_text(text):
+    engine.setProperty('rate', 150)
+    engine.say(text)
+    engine.runAndWait()
+
+# ========== VOICE INPUT ==========
+def capture_voice_input():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("Listening...")
+        recognizer.adjust_for_ambient_noise(source, duration=1)
+        try:
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            print("Processing voice input...")
+            text = recognizer.recognize_google(audio)
+            print(f"[You (Voice)]: {text}")
+            return text
+        except sr.WaitTimeoutError:
+            speak_text("No speech detected. Please try again.")
+        except sr.UnknownValueError:
+            speak_text("Sorry, I couldn't understand what you said.")
+        except sr.RequestError as e:
+            speak_text(f"Error with speech recognition: {e}")
+    return None
+
+# ========== GEMINI CONFIG ==========
+def configure_model():
+    generation_config = {
+        "temperature": 0.2,
+        "max_output_tokens": 1024,
+        "top_p": 0.95,
+        "top_k": 40,
+    }
+    safety_settings = [
+        {
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+        },
+    ]
+    return genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        generation_config=generation_config,
+        safety_settings=safety_settings,
+        system_instruction=(
+            "You are a conversational AI. Provide helpful, concise, and contextual responses. "
+            "If asked for date or time, provide the current information."
+        )
+    )
+# ========== CAMERA IMAGE CAPTURE ==========
+def capture_image(cap):
+    if not cap.isOpened():
+        print("Camera not accessible")
+        speak_text("Sorry, I could not access the camera.")
+        return None
+
+    # Warm-up and flush frames
+    for i in range(10):
+        ret, _ = cap.read()
+        if not ret:
+            print(f"Warning: Failed to read frame during warm-up [{i+1}/10]")
+        time.sleep(0.05)
+
+    # Final frame capture
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print("Failed to capture image")
+        speak_text("Failed to capture image.")
+        return None
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(frame_rgb)
+
+    # Optional: save for debugging
+    # pil_image.save("debug_captured.jpg")
+
+    return pil_image
+
+
+# ========== SCENE DESCRIPTION ==========
+def describe_scene(model, cap):
+    image = capture_image(cap)
+    if image is None:
+        return
+    try:
+        response = model.generate_content(["Describe this image briefly for a blind user", image])
+        speak_text(response.text)
+        print("[Scene]:", response.text)
+    except Exception as e:
+        speak_text(f"Error during scene description: {e}")
+
+# ========== TEXT DETECTION ==========
+def detect_text_with_gemini(model, cap):
+    image = capture_image(cap)
+    if image is None:
+        return
+    try:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        img_bytes = buffer.getvalue()
+        response = model.generate_content([
+            {"text": "Extract all visible text from this image."},
+            {"inline_data": {
+                "mime_type": "image/png",
+                "data": img_bytes
+            }}
+        ])
+        text = response.text
+        if text.strip():
+            speak_text("The text in the image is: " + text)
+            print("[Detected Text]:", text)
+        else:
+            speak_text("No text was detected in the image.")
+            print("[Detected Text]: No text detected")
+    except Exception as e:
+        speak_text(f"Error during text detection: {e}")
+
+# ========== OBJECT DETECTION ==========
+def object_detection(cap, detection_model):
+    for _ in range(5):
+        cap.read()
+        time.sleep(0.05)
+
+    start_time = time.time()
+    accumulated_labels = set()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[ERROR] Failed to read from camera.")
+            speak_text("Failed to read from camera.")
+            return
+
+        results = detection_model.predict(frame)
+        boxes = results[0].boxes if results else []
+        current_frame_labels = set()
+
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            label = detection_model.names[cls_id]
+            current_frame_labels.add(label)
+
+            x1, y1, x2, y2 = box.xyxy[0]
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            cv2.putText(frame, label, (int(x1), int(y1) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        new_labels = current_frame_labels - accumulated_labels
+        if new_labels:
+            accumulated_labels.update(new_labels)
+            phrase = "I see a " + ", ".join(new_labels)
+            speak_text(phrase)
+            print("[INFO] Speaking:", phrase)
+
+        cv2.imshow("Object Detection", frame)
+        cv2.waitKey(10)
+
+        if time.time() - start_time > 30:
+            speak_text("Object detection has ended after 30 seconds.")
+            print("[INFO] Object detection finished.")
+            cv2.destroyAllWindows()
+            break
+
+# ========== LOCATION ==========
+home_coords = (22.9006, 89.5024)
+geolocator = Nominatim(user_agent="gps_location_converter")
+
+def get_location(timeout=10):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            packet = gpsd.get_current()
+            if packet.mode >= 2:
+                lat, lon = packet.lat, packet.lon
+                current_coords = (lat, lon)
+                distance = geodesic(home_coords, current_coords).km
+                try:
+                    location = geolocator.reverse(current_coords, language='en')
+                    address = location.address if location else "Unknown"
+                    raw = location.raw.get('address', {}) if location else {}
+                    parts = [raw.get(k) for k in ['city', 'town', 'village', 'neighbourhood', 'suburb', 'landmark'] if raw.get(k)]
+                    prominent_location = ", ".join(parts) if parts else "an unknown area"
+                except Exception:
+                    address = "Geocoding failed"
+                    prominent_location = "an unknown area"
+
+                return {
+                    "text": f"Lat: {lat:.6f}, Lon: {lon:.6f}\nAddress: {address}\nDistance from KUET: {distance:.2f} km",
+                    "distance_km": distance,
+                    "prominent_location": prominent_location
+                }
+            time.sleep(1)
+        except Exception:
+            time.sleep(1)
+    return {"text": "No GPS fix obtained.", "distance_km": None, "prominent_location": "an unknown area"}
+
+def speak_location():
+    data = get_location()
+    if data["distance_km"]:
+        message = f"You are {data['distance_km']:.2f} km from KUET, in or near {data['prominent_location']}."
+    else:
+        message = f"I couldn't determine your location. You are in or near {data['prominent_location']}."
+    speak_text(message)
+    print("[Location]:", data["text"])
+
+# ========== TELEGRAM ==========
+api_id = 28016787
+api_hash = 'a2ee5b8af5c1d4759ed1c27d6b4b0aa3'
+phone = '+8801717499969'
+
+async def send_location():
+    try:
+        async with TelegramClient('session_name', api_id, api_hash) as client:
+            await client.start(phone)
+            loc = get_location()
+            #await client.send_message('me', loc["text"])
+            await client.send_message('me', f"User's Current Location:\n{loc['text']}")
+            speak_text("Location has been sent to your Telegram.")
+    except Exception as e:
+        speak_text(f"Error sending location: {e}")
+
+# ========== AI CHAT ==========
+def generate_response_with_speech(model, user_query):
+    if "date" in user_query.lower():
+        response = f"Today's date is {datetime.now().strftime('%Y-%m-%d')}"
+    elif "time" in user_query.lower():
+        response = f"The current time is {datetime.now().strftime('%H:%M:%S')}"
+    else:
+        try:
+            response = model.generate_content(user_query).text
+        except Exception as e:
+            response = f"Error: {e}"
+    speak_text(response)
+    print("[AI]:", response)
+
+# ========== MAIN HANDLER ==========
+def handle_user_input(model, detection_model, cap, query):
+    query = query.lower()
+    if "scene" in query or "describe" in query or "see" in query:
+        describe_scene(model, cap)
+    elif "read" in query or "text" in query:
+        detect_text_with_gemini(model, cap)
+    elif "object" in query:
+        object_detection(cap, detection_model)
+    elif "where am i" in query or "location" in query:
+        speak_location()
+    elif "send" in query or "coordinates" in query:
+        import asyncio
+        asyncio.run(send_location())
+    else:
+        generate_response_with_speech(model, query)
+
+# ========== MAIN ==========
+if __name__ == "__main__":
+    try:
+        gpsd.connect()
+    except Exception as e:
+        print("GPS connection error:", e)
+        speak_text("GPS not working.")
+        exit(1)
+
+    genai.configure(api_key="AIzaSyBx9IGpHPQLvud_g4t_93MuUuMXSpMKZVU")
+    model = configure_model()
+    detection_model = YOLO('yolov8n.pt')
+    detection_model.export(format="ncnn", imgsz=320)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        speak_text("Failed to open camera.")
+        exit()
+
+    speak_text("Hello! I'm ready. Say describe, read, object detection, or location to begin.")
+
+    while True:
+        try:
+            user_query = capture_voice_input()
+            if user_query is None:
+                continue
+            if user_query.strip().lower() in ["exit", "quit", "goodbye", "stop"]:
+                speak_text("Goodbye!")
+                break
+            handle_user_input(model, detection_model, cap, user_query)
+        except KeyboardInterrupt:
+            speak_text("Session ended.")
+            break
+    cap.release()
+    cv2.destroyAllWindows()
